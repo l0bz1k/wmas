@@ -15,6 +15,8 @@ import subprocess
 import time
 import urllib.parse
 import urllib.request
+import plistlib
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -23,7 +25,13 @@ STATE = ROOT / "state"
 ARTIFACTS = ROOT / "artifacts"
 DEFAULT_PROFILE = "default"
 PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-PLATFORM = "macos"
+# ipatool platform name -> how WMAS presents and looks it up.
+PLATFORMS = {
+    "macos": {"label": "Mac", "os": "macOS", "entity": "macSoftware", "page": "mac", "extension": ".pkg"},
+    "iphone": {"label": "iPhone", "os": "iOS", "entity": "software", "page": "iphone", "extension": ".ipa"},
+    "ipad": {"label": "iPad", "os": "iPadOS", "entity": "iPadSoftware", "page": "ipad", "extension": ".ipa"},
+}
+PLATFORM_ALIASES = {"mac": "macos", "osx": "macos", "ios": "iphone", "ipados": "ipad"}
 
 # Apple answers request volume with 429, with 403 on the commerce endpoint, with
 # empty bodies and with dropped connections. All of them mean "slow down".
@@ -73,12 +81,20 @@ def parse_app_id(text):
     return int(match.group(1)) if match else None
 
 
+def normalize_platform(text):
+    name = (text or "macos").strip().lower()
+    name = PLATFORM_ALIASES.get(name, name)
+    if name not in PLATFORMS:
+        raise WmasError("unknown platform %r: use mac, iphone or ipad" % text)
+    return name
+
+
 def safe_name(text):
     return re.sub(r"[^A-Za-z0-9._-]+", "-", text or "").strip("-") or "app"
 
 
 class Engine:
-    def __init__(self, profile=None, pace=2.5, notify=None):
+    def __init__(self, profile=None, pace=2.5, notify=None, platform=None):
         STATE.mkdir(parents=True, exist_ok=True)
         self._config_path = STATE / "config.json"
         self.config = {"current": DEFAULT_PROFILE, "profiles": {}}
@@ -97,6 +113,7 @@ class Engine:
         self.profile = profile or self.config["current"]
         if self.profile not in profiles:
             raise WmasError("unknown profile %r; run 'wmas accounts' to list profiles" % self.profile)
+        self.platform = normalize_platform(platform or self.config.get("platform"))
         self.pace = pace
         self.notify = notify or (lambda message: None)
         self._last_call = 0.0
@@ -114,6 +131,13 @@ class Engine:
                 PRIMARY KEY (app_id, ext_id));
             CREATE TABLE IF NOT EXISTS histories (
                 app_id INTEGER PRIMARY KEY, entries TEXT NOT NULL, fetched_at REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS version_lists_v2 (
+                app_id INTEGER NOT NULL, platform TEXT NOT NULL, ids TEXT NOT NULL, fetched_at REAL NOT NULL,
+                PRIMARY KEY (app_id, platform));
+            CREATE TABLE IF NOT EXISTS histories_v2 (
+                app_id INTEGER NOT NULL, platform TEXT NOT NULL, entries TEXT NOT NULL, fetched_at REAL NOT NULL,
+                PRIMARY KEY (app_id, platform));
+            INSERT OR IGNORE INTO version_lists_v2 SELECT app_id, 'macos', ids, fetched_at FROM version_lists;
             CREATE TABLE IF NOT EXISTS downloads (
                 app_id INTEGER, ext_id TEXT, path TEXT, sha256 TEXT, signature TEXT, at REAL);
         """)
@@ -192,6 +216,21 @@ class Engine:
                 time.sleep(8)
                 continue
             raise WmasError(error)
+
+    # ---- platform -------------------------------------------------------
+
+    def set_platform(self, platform):
+        self.platform = normalize_platform(platform)
+        self.config["platform"] = self.platform
+        self._save_config()
+
+    @property
+    def platform_label(self):
+        return PLATFORMS[self.platform]["label"]
+
+    @property
+    def os_name(self):
+        return PLATFORMS[self.platform]["os"]
 
     # ---- accounts -------------------------------------------------------
 
@@ -285,8 +324,8 @@ class Engine:
 
     def search(self, term, limit=10):
         """Search the account's storefront catalogue."""
-        data = self._ipatool(["search", term, "--platform", PLATFORM, "--limit", str(limit)], paced=True)
-        apps = [app for app in data.get("apps", []) if PLATFORM in app.get("platforms", [PLATFORM])]
+        data = self._ipatool(["search", term, "--platform", self.platform, "--limit", str(limit)], paced=True)
+        apps = [app for app in data.get("apps", []) if self.platform in app.get("platforms", [self.platform])]
         for app in apps:
             self._remember_app(app)
         return apps
@@ -296,7 +335,7 @@ class Engine:
         found, page = [], 1
         while True:
             data = self._ipatool(
-                ["list-purchases", "--platform", PLATFORM, "-l", "100", "-p", str(page)], paced=True)
+                ["list-purchases", "--platform", self.platform, "-l", "100", "-p", str(page)], paced=True)
             apps = data.get("apps", [])
             for app in apps:
                 self._remember_app(app)
@@ -316,7 +355,7 @@ class Engine:
             return {"id": row["app_id"], "bundleID": row["bundle_id"], "name": row["name"], "price": row["price"]}
         app = {"id": int(app_id), "bundleID": "", "name": "app-%s" % app_id, "price": None}
         try:
-            url = "https://itunes.apple.com/lookup?" + urllib.parse.urlencode({"id": app_id, "entity": "macSoftware"})
+            url = "https://itunes.apple.com/lookup?" + urllib.parse.urlencode({"id": app_id, "entity": PLATFORMS[self.platform]["entity"]})
             with urllib.request.urlopen(url, timeout=15) as reply:
                 results = json.load(reply).get("results", [])
             if results:
@@ -331,21 +370,26 @@ class Engine:
 
     def version_ids(self, app_id, refresh=False):
         """External version identifiers, oldest first."""
-        row = self.db.execute("SELECT * FROM version_lists WHERE app_id=?", (app_id,)).fetchone()
+        row = self.db.execute("SELECT * FROM version_lists_v2 WHERE app_id=? AND platform=?",
+                              (app_id, self.platform)).fetchone()
         if row and not refresh and time.time() - row["fetched_at"] < VERSION_LIST_TTL:
             return json.loads(row["ids"])
-        data = self._ipatool(["list-versions", "-i", str(app_id), "--platform", PLATFORM], paced=True)
+        data = self._ipatool(["list-versions", "-i", str(app_id), "--platform", self.platform], paced=True)
         ids = [str(i) for i in data.get("externalVersionIdentifiers", [])]
         if not ids:
             raise WmasError("the Store returned no version list")
-        self.db.execute("INSERT OR REPLACE INTO version_lists VALUES (?,?,?)", (app_id, json.dumps(ids), time.time()))
+        self.db.execute("INSERT OR REPLACE INTO version_lists_v2 VALUES (?,?,?,?)",
+                        (app_id, self.platform, json.dumps(ids), time.time()))
         self.db.commit()
         return ids
 
     def cached(self, app_id):
-        """Every probed version of an app, keyed by external version identifier."""
+        """Probed versions of an app on the current platform, keyed by version ID."""
         rows = self.db.execute("SELECT * FROM versions WHERE app_id=?", (app_id,)).fetchall()
-        return {row["ext_id"]: dict(row) for row in rows}
+        listed = self.db.execute("SELECT ids FROM version_lists_v2 WHERE app_id=? AND platform=?",
+                                 (app_id, self.platform)).fetchone()
+        wanted = set(json.loads(listed["ids"])) if listed else None
+        return {row["ext_id"]: dict(row) for row in rows if wanted is None or row["ext_id"] in wanted}
 
     def probe(self, app_id, ext_id, force=False):
         """Version, release date, minimum OS and architectures of one build.
@@ -364,12 +408,13 @@ class Engine:
                   "probed_at": time.time()}
         try:
             data = self._ipatool(
-                ["get-version-metadata", "-i", str(app_id), "--platform", PLATFORM,
-                 "--external-version-id", str(ext_id), "--probe-only"], paced=True)
+                ["get-version-metadata", "-i", str(app_id), "--platform", self.platform,
+                 "--external-version-id", str(ext_id)] + (["--probe-only"] if self.platform == "macos" else []),
+                paced=True)
             record.update(
                 display_version=data.get("displayVersion"), bundle_version=data.get("bundleVersion"),
                 release_date=(data.get("releaseDate") or "")[:10], min_os=data.get("minimumOS") or "",
-                arch=data.get("architectures") or "", package_size=data.get("packageSize"))
+                arch=data.get("architectures") or data.get("deviceFamilies") or "", package_size=data.get("packageSize"))
         except (Throttled, NotSignedIn, LicenseRequired):
             raise
         except WmasError as failure:
@@ -521,14 +566,16 @@ class Engine:
         This is what the store page advertises, which can be more than the Store
         will actually serve: the commerce API lists only the builds still offered.
         """
-        row = self.db.execute("SELECT * FROM histories WHERE app_id=?", (app_id,)).fetchone()
+        row = self.db.execute("SELECT * FROM histories_v2 WHERE app_id=? AND platform=?",
+                              (app_id, self.platform)).fetchone()
         if row and not refresh and time.time() - row["fetched_at"] < HISTORY_TTL:
             return json.loads(row["entries"])
         entries = []
         for country in HISTORY_COUNTRIES:
             try:
                 request = urllib.request.Request(
-                    "https://apps.apple.com/%s/app/id%d?platform=mac" % (country, int(app_id)),
+                    "https://apps.apple.com/%s/app/id%d?platform=%s" % (
+                        country, int(app_id), PLATFORMS[self.platform]["page"]),
                     headers={"User-Agent": BROWSER_UA})
                 with urllib.request.urlopen(request, timeout=20) as reply:
                     page = reply.read().decode("utf-8", "ignore")
@@ -544,8 +591,8 @@ class Engine:
                 break
         if entries:
             entries.sort(key=lambda entry: version_key(entry["version"]), reverse=True)
-            self.db.execute("INSERT OR REPLACE INTO histories VALUES (?,?,?)",
-                            (app_id, json.dumps(entries), time.time()))
+            self.db.execute("INSERT OR REPLACE INTO histories_v2 VALUES (?,?,?,?)",
+                            (app_id, self.platform, json.dumps(entries), time.time()))
             self.db.commit()
         return entries
 
@@ -596,7 +643,7 @@ class Engine:
 
     def purchase(self, app_id):
         """Obtain a licence for a free app."""
-        return self._ipatool(["purchase", "-i", str(app_id), "--platform", PLATFORM], paced=True)
+        return self._ipatool(["purchase", "-i", str(app_id), "--platform", self.platform], paced=True)
 
     def download(self, app_id, ext_id, directory=None, show_progress=True):
         """Download one build, then check Apple's signature and record the hash."""
@@ -606,9 +653,10 @@ class Engine:
             raise WmasError("version unavailable: %s" % row["error"])
         folder = Path(directory) if directory else ARTIFACTS / safe_name(app["name"]).lower()
         folder.mkdir(parents=True, exist_ok=True)
-        target = folder / ("%s-%s.pkg" % (safe_name(app["name"]), safe_name(row["display_version"])))
+        target = folder / ("%s-%s%s" % (safe_name(app["name"]), safe_name(row["display_version"]),
+                                        PLATFORMS[self.platform]["extension"]))
         self._ipatool(
-            ["download", "-i", str(app_id), "--platform", PLATFORM, "--external-version-id", str(ext_id),
+            ["download", "-i", str(app_id), "--platform", self.platform, "--external-version-id", str(ext_id),
              "-o", str(target)], paced=True, show_progress=show_progress)
         if not target.exists():
             raise WmasError("ipatool reported success but the file is missing: %s" % target)
@@ -616,12 +664,24 @@ class Engine:
         with open(target, "rb") as handle:
             for block in iter(lambda: handle.read(1 << 20), b""):
                 digest.update(block)
-        check = subprocess.run(["pkgutil", "--check-signature", str(target)], text=True, capture_output=True)
-        status = next((line.split("Status:", 1)[1].strip() for line in check.stdout.splitlines()
-                       if "Status:" in line), "signature status unknown")
-        result = {"path": str(target), "sha256": digest.hexdigest(), "signature": status,
-                  "signed_by_apple": "signed by Apple" in status, "size": target.stat().st_size,
-                  "version": row["display_version"], "min_os": row["min_os"]}
+        if self.platform == "macos":
+            check = subprocess.run(["pkgutil", "--check-signature", str(target)], text=True, capture_output=True)
+            status = next((line.split("Status:", 1)[1].strip() for line in check.stdout.splitlines()
+                           if "Status:" in line), "signature status unknown")
+            verified = "signed by Apple" in status
+        else:
+            # An IPA has no installer signature to check; confirm it is the build asked for.
+            try:
+                with zipfile.ZipFile(target) as archive:
+                    name = next(n for n in archive.namelist() if re.fullmatch(r"Payload/[^/]+\.app/Info\.plist", n))
+                    found = plistlib.loads(archive.read(name)).get("CFBundleShortVersionString")
+                verified = version_key(found) == version_key(row["display_version"])
+                status = "IPA contains version %s%s" % (found, "" if verified else " — NOT the requested one")
+            except Exception as failure:
+                verified, status = False, "IPA could not be read: %s" % failure
+        result = {"path": str(target), "sha256": digest.hexdigest(), "signature": status, "verified": verified,
+                  "signed_by_apple": verified and self.platform == "macos", "size": target.stat().st_size,
+                  "version": row["display_version"], "min_os": row["min_os"], "platform": self.platform}
         self.db.execute("INSERT INTO downloads VALUES (?,?,?,?,?,?)",
                         (app_id, str(ext_id), str(target), result["sha256"], status, time.time()))
         self.db.commit()

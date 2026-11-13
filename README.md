@@ -1,11 +1,11 @@
 <p align="center"><img src="docs/image.png" alt="WMAS" width="420"></p>
 
-# WMAS — Wayback Machine for the Mac App Store
+# WMAS — Wayback Machine for the App Store
 
-Apple keeps old builds of Mac App Store apps on its servers, but the App Store app
-only ever offers the newest one. WMAS lists the versions the Store still serves for
-an app, shows the minimum macOS each one needs, and downloads the one you pick as the
-original Apple-signed package.
+Apple keeps old builds of App Store apps on its servers, but the App Store only ever
+offers the newest one. WMAS lists the versions the Store still serves for a Mac,
+iPhone or iPad app, shows the minimum system each one needs, and downloads the one
+you pick: the original Apple-signed package for a Mac app, the IPA for an iOS app.
 
 ```
 $ wmas versions LanScan
@@ -33,10 +33,13 @@ certificate tampering and nothing to disable on the Mac.
 
 - Finds an app by name, App ID (`1476245357`, `id1476245357`) or App Store link, in
   the catalogue or in your purchases, which also covers apps pulled from sale.
-- Lists the versions the Store serves, each with release date, minimum macOS and
-  architectures, read from about 64 KB of the package instead of the whole download.
-- Answers "what is the newest version that runs on macOS X" directly.
-- Downloads any listed version, checks Apple's signature and records the SHA-256.
+- Works for Mac, iPhone and iPad apps (`--platform mac|iphone|ipad`).
+- Lists the versions the Store serves, each with release date, minimum system and
+  architectures or device families, read from a few kilobytes of the package instead
+  of the whole download.
+- Answers "what is the newest version that runs on macOS 11 / iOS 12" directly.
+- Downloads any listed version, verifies it (Apple's signature for a Mac package, the
+  embedded version for an IPA) and records the SHA-256.
 - Keeps several Apple IDs side by side as named profiles.
 - Prints JSON on request (`--json`), so a GUI can sit on top of it.
 
@@ -53,6 +56,9 @@ certificate tampering and nothing to disable on the Mac.
     scripts/build-ipatool.sh      # clones ipatool at the pinned commit, applies our patches
     scripts/wmas                  # interactive session; sign in when asked
 
+The first run of a freshly built `ipatool` can take up to a minute; later runs are
+quick.
+
 `scripts/wmas` can be symlinked into a directory on your `PATH`. Your password and
 2FA code are typed into `ipatool` itself and never pass through WMAS.
 
@@ -65,6 +71,13 @@ certificate tampering and nothing to disable on the Mac.
     wmas versions LanScan --full          # probe every version; resumable, cached for good
     wmas versions LanScan --for-macos 11  # newest version that runs on macOS 11
     wmas download LanScan 8.2.11          # by version or by version ID
+
+iPhone and iPad apps: add `--platform`, or press `p` in the interactive session.
+
+    wmas --platform iphone versions id686449807 --for-os 12   # Telegram: newest for iOS 12
+    wmas --platform iphone download id686449807 11.12.1
+
+An IPA is tied to the Apple ID that downloaded it, as with any App Store purchase.
 
 Apple ID profiles. A profile name is any label you choose.
 
@@ -102,7 +115,7 @@ The protocol details are in [docs/findings.md](docs/findings.md).
   runs without one, so in-app purchases cannot validate.
 - **Apple rate-limits.** HTTP 403 on the download endpoint means "slow down", not
   "denied"; WMAS backs off and retries.
-- Mac apps only for now.
+- For a universal app the iPhone and iPad version lists are the same.
 
 ## Layout
 

@@ -182,3 +182,19 @@ macOS and 891316378 on iOS).
 `wmas` maps a user-chosen profile label to the storage name passed as
 `IPATOOL_PROFILE`, so renaming a profile only rewrites `state/config.json` and never
 touches the keychain. The first profile uses ipatool's stock storage.
+
+## iPhone and iPad apps
+
+The same commerce API serves iOS apps (`--platform iphone` / `ipad`); for a universal
+app both platforms return the same identifiers. An IPA is an ordinary zip on the CDN,
+not encrypted in transit like a Mac package (only the executable inside is), so its
+`Info.plist` can be read by ranged request, which upstream ipatool already does for
+the version string. Our patch also returns `MinimumOSVersion`, `CFBundleVersion` and
+`UIDeviceFamily` from it. One probe costs a commerce request and a few kilobytes.
+
+Minimum iOS is monotonic in practice as well: Telegram for iPhone has 362 served
+versions back to 1.0 (iOS 5.0), and bisection found the newest one for iOS 12
+(11.12.1, 2025-06-06) in about ten probes.
+
+A freshly built ipatool binary takes 30-45 s on its first launch; later launches are
+fast. This looked like a hang during testing and is not one.

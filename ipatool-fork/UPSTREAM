@@ -16,12 +16,13 @@ like ipatool-fork/upstream collides with this UPSTREAM file.
 Patches:
   storefront-fix.patch   static storefront table fallback + iTunes UA (needs
                          storefront_static.go copied in first)
-  version-probe.patch    get-version-metadata reads Mac packages by ranged probe:
-                         XAR table of contents from the first chunk, then the
-                         chunk-aligned tail with PackageInfo and Distribution.
-                         Adds minimumOS, architectures, bundleVersion, packageSize,
-                         bytesFetched to the output and a --probe-only flag.
-                         Upstream downloads the entire package for this.
+  version-probe.patch    get-version-metadata reports minimumOS and more without a
+                         full download. Mac packages: ranged probe of the XAR table
+                         of contents and the chunk-aligned tail (upstream downloads
+                         the entire package), adding architectures, bundleVersion,
+                         packageSize, bytesFetched and a --probe-only flag. IPAs:
+                         MinimumOSVersion, CFBundleVersion and device families from
+                         the Info.plist upstream already reads by range.
   profiles.patch         IPATOOL_PROFILE=<name> isolates an Apple ID: its own keychain
                          service (ipatool-auth.service.<name>) and state directory
                          (~/.ipatool/profiles/<name>). Unset keeps stock storage, so

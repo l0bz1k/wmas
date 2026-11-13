@@ -1,3 +1,3 @@
-"""WMAS: older Mac App Store versions."""
+"""WMAS: older App Store versions for Mac, iPhone and iPad."""
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

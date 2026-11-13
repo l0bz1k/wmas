@@ -32,8 +32,16 @@ def probe_progress(row):
         note("probed %s — %s" % (row["display_version"], os_label(row["min_os"])))
 
 
+OS_NAME = "macOS"
+
+
+def set_platform_labels(engine):
+    global OS_NAME
+    OS_NAME = engine.os_name
+
+
 def os_label(min_os):
-    return "macOS %s+" % min_os if min_os else "min. macOS not stated"
+    return "%s %s+" % (OS_NAME, min_os) if min_os else "min. %s not stated" % OS_NAME
 
 
 def price_label(app):
@@ -165,8 +173,11 @@ def print_apps(apps):
 def print_versions(engine, app):
     """Newest first. Probed builds are numbered; runs of unprobed builds collapse."""
     rows = engine.table(app["id"])
-    say("%s — %d version%s offered by the Store" % (app["name"], len(rows), "" if len(rows) == 1 else "s"))
-    say("  #  %-14s %-11s %-16s %-16s %s" % ("Version", "Released", "Minimum system", "Architectures", "Version ID"))
+    say("%s for %s — %d version%s offered by the Store" % (
+        app["name"], engine.platform_label, len(rows), "" if len(rows) == 1 else "s"))
+    say("  #  %-14s %-11s %-16s %-16s %s" % (
+        "Version", "Released", "Minimum system",
+        "Architectures" if engine.platform == "macos" else "Devices", "Version ID"))
     numbered, pending = [], []
 
     def flush():
@@ -241,8 +252,7 @@ def report_download(result):
     say("Done: %s" % result["path"])
     say("  version %s, %s, %d bytes" % (result["version"], os_label(result["min_os"]), result["size"]))
     say("  SHA-256: %s" % result["sha256"])
-    say("  signature: %s%s" % (
-        result["signature"], "" if result["signed_by_apple"] else "  <- WARNING: not an Apple signature"))
+    say("  check: %s%s" % (result["signature"], "" if result["verified"] else "  <- WARNING: verification failed"))
 
 
 # ---- interactive --------------------------------------------------------
@@ -256,8 +266,8 @@ def version_menu(engine, app):
         say()
         numbered = print_versions(engine, app)
         say()
-        choice = ask("# or version — download, f — probe all, m <macOS> — newest for that system, "
-                     "Enter — back, q — quit: ")
+        choice = ask("# or version — download, f — probe all, m <%s version> — newest for that system, "
+                     "Enter — back, q — quit: " % engine.os_name)
         if not choice:
             return
         try:
@@ -271,9 +281,9 @@ def version_menu(engine, app):
                     say("Stopped; everything probed so far is cached.")
                 continue
             if choice.lower() == "m" or choice.lower().startswith("m "):
-                macos = choice[1:].strip() or ask("macOS version (for example 11): ")
+                macos = choice[1:].strip() or ask("%s version (for example 15): " % engine.os_name)
                 row = engine.newest_for(app["id"], macos, probe_progress)
-                say("Newest version for macOS %s: %s" % (macos, "%s (%s, %s)" % (
+                say("Newest version for %s %s: %s" % (engine.os_name, macos, "%s (%s, %s)" % (
                     row["display_version"], row["release_date"], os_label(row["min_os"])) if row else "none"))
                 if not row or ask("Download it? [y/N]: ").lower() != "y":
                     continue
@@ -296,13 +306,20 @@ def interactive(engine):
         return 1
     while True:
         say()
-        text = ask("App name, App ID or App Store link  (o <text> — search purchases, a — accounts, q — quit): ")
+        text = ask("[%s] App name, App ID or App Store link  (p — platform, o <text> — search purchases, "
+                   "a — accounts, q — quit): " % engine.platform_label)
         if not text:
             continue
         try:
             app_id = core.parse_app_id(text)
             if text.lower() == "a":
                 account_menu(engine)
+                continue
+            if text.lower() == "p" or text.lower().startswith("p "):
+                wanted = text[1:].strip() or ask("Platform — mac, iphone or ipad: ")
+                if wanted:
+                    engine.set_platform(wanted)
+                    set_platform_labels(engine)
                 continue
             if text.lower() == "o" or text.lower().startswith("o "):
                 apps = engine.owned(text[1:].strip() or None)
@@ -335,6 +352,7 @@ def main(argv=None):
         prog="wmas", description="Find and download older versions of Mac App Store apps. "
         "With no command it starts an interactive session.")
     parser.add_argument("--profile", metavar="NAME", help="Apple ID profile to use (default: the last one selected)")
+    parser.add_argument("--platform", metavar="P", help="mac, iphone or ipad (default: the last one used)")
     parser.add_argument("--json", action="store_true", help="print JSON; messages go to stderr")
     parser.add_argument("--version", action="version", version="wmas %s" % __version__)
     sub = parser.add_subparsers(dest="command")
@@ -342,11 +360,12 @@ def main(argv=None):
     p.add_argument("term")
     p.add_argument("--owned", action="store_true", help="search the account's purchases, including apps pulled from sale")
     p.add_argument("--limit", type=int, default=10)
-    p = sub.add_parser("versions", help="list an app's versions with their minimum macOS")
+    p = sub.add_parser("versions", help="list an app's versions with the minimum system each needs")
     p.add_argument("app", help="App ID (1476245357 or id1476245357), App Store link, or name")
     p.add_argument("--full", action="store_true", help="probe every version (slow the first time, cached after)")
     p.add_argument("--cached", action="store_true", help="show only what is already cached")
-    p.add_argument("--for-macos", metavar="X", help="find the newest version that runs on macOS X")
+    p.add_argument("--for-os", "--for-macos", "--for-ios", dest="for_macos", metavar="X",
+                   help="find the newest version that runs on system version X")
     p.add_argument("--acquire", action="store_true", help="get the licence if a free app is not owned yet")
     p = sub.add_parser("download", help="download one version")
     p.add_argument("app", help="App ID, App Store link, or name")
@@ -366,7 +385,8 @@ def main(argv=None):
     OUTPUT_JSON = args.json
 
     try:
-        engine = core.Engine(profile=args.profile, notify=note)
+        engine = core.Engine(profile=args.profile, notify=note, platform=args.platform)
+        set_platform_labels(engine)
         if not args.command:
             return interactive(engine)
 
@@ -414,11 +434,11 @@ def main(argv=None):
                 if args.json:
                     print(json.dumps(row, ensure_ascii=False, indent=2))
                 elif row:
-                    say("%s: newest version for macOS %s is %s (%s, %s), version ID %s" % (
-                        app["name"], args.for_macos, row["display_version"], row["release_date"],
+                    say("%s: newest version for %s %s is %s (%s, %s), version ID %s" % (
+                        app["name"], engine.os_name, args.for_macos, row["display_version"], row["release_date"],
                         os_label(row["min_os"]), row["ext_id"]))
                 else:
-                    say("No offered version runs on macOS %s." % args.for_macos)
+                    say("No offered version runs on %s %s." % (engine.os_name, args.for_macos))
                 return 0 if row else 3
             if args.full:
                 engine.fill(app["id"], probe_progress)
@@ -440,7 +460,7 @@ def main(argv=None):
                 print(json.dumps(result, ensure_ascii=False, indent=2))
             else:
                 report_download(result)
-            return 0 if result["signed_by_apple"] else 4
+            return 0 if result["verified"] else 4
     except Quit:
         return 0
     except core.NotSignedIn:

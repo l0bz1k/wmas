@@ -1,5 +1,5 @@
 diff --git a/cmd/get_version_metadata.go b/cmd/get_version_metadata.go
-index 5f307ca..bd976a1 100644
+index 5f307ca..96fd7db 100644
 --- a/cmd/get_version_metadata.go
 +++ b/cmd/get_version_metadata.go
 @@ -16,6 +16,7 @@ func getVersionMetadataCmd() *cobra.Command {
@@ -10,7 +10,7 @@ index 5f307ca..bd976a1 100644
  	)
  
  	cmd := &cobra.Command{
-@@ -70,17 +71,35 @@ func getVersionMetadataCmd() *cobra.Command {
+@@ -70,17 +71,42 @@ func getVersionMetadataCmd() *cobra.Command {
  					App:       app,
  					VersionID: externalVersionID,
  					Platform:  platform,
@@ -42,6 +42,13 @@ index 5f307ca..bd976a1 100644
 +						Int64("bytesFetched", out.BytesFetched)
 +				}
 +
++				if out.Method == "ipa" {
++					event = event.
++						Str("bundleVersion", out.BundleVersion).
++						Str("minimumOS", out.MinimumOS).
++						Str("deviceFamilies", out.DeviceFamilies)
++				}
++
 +				if out.ProbeError != "" {
 +					event = event.Str("probeError", out.ProbeError)
 +				}
@@ -50,7 +57,7 @@ index 5f307ca..bd976a1 100644
  
  				return nil
  			},
-@@ -103,6 +122,8 @@ func getVersionMetadataCmd() *cobra.Command {
+@@ -103,6 +129,8 @@ func getVersionMetadataCmd() *cobra.Command {
  
  	cmd.Flags().StringVar(&platformValue, "platform", "", "Platform to retrieve metadata for: iphone (iOS), ipad (iPadOS), appletv (tvOS), watchos, visionos, or macos")
  
@@ -60,10 +67,10 @@ index 5f307ca..bd976a1 100644
  
  	return cmd
 diff --git a/pkg/appstore/appstore_get_version_metadata.go b/pkg/appstore/appstore_get_version_metadata.go
-index e81877e..4a8da48 100644
+index e81877e..4163da3 100644
 --- a/pkg/appstore/appstore_get_version_metadata.go
 +++ b/pkg/appstore/appstore_get_version_metadata.go
-@@ -14,11 +14,23 @@ type GetVersionMetadataInput struct {
+@@ -14,11 +14,25 @@ type GetVersionMetadataInput struct {
  	App       App
  	VersionID string
  	Platform  Platform
@@ -81,13 +88,15 @@ index e81877e..4a8da48 100644
 +	Architectures string
 +	PackageSize   int64
 +	BytesFetched  int64
++	// DeviceFamilies is only filled for IPAs, from UIDeviceFamily.
++	DeviceFamilies string
 +	// Method is "probe" (ranged read), "full" (whole package) or "ipa".
 +	Method     string
 +	ProbeError string
  }
  
  func (t *appstore) GetVersionMetadata(input GetVersionMetadataInput) (GetVersionMetadataOutput, error) {
-@@ -88,12 +100,35 @@ func (t *appstore) GetVersionMetadata(input GetVersionMetadataInput) (GetVersion
+@@ -88,12 +102,35 @@ func (t *appstore) GetVersionMetadata(input GetVersionMetadataInput) (GetVersion
  				return GetVersionMetadataOutput{}, err
  			}
  
@@ -124,12 +133,19 @@ index e81877e..4a8da48 100644
  		}
  	}
  
-@@ -105,5 +140,5 @@ func (t *appstore) GetVersionMetadata(input GetVersionMetadataInput) (GetVersion
+@@ -105,5 +142,12 @@ func (t *appstore) GetVersionMetadata(input GetVersionMetadataInput) (GetVersion
  		return GetVersionMetadataOutput{}, fmt.Errorf("failed to read version metadata: %w", err)
  	}
  
 -	return GetVersionMetadataOutput(metadata), nil
-+	return GetVersionMetadataOutput{DisplayVersion: metadata.DisplayVersion, ReleaseDate: metadata.ReleaseDate, Method: "ipa"}, nil
++	return GetVersionMetadataOutput{
++		DisplayVersion: metadata.DisplayVersion,
++		ReleaseDate:    metadata.ReleaseDate,
++		BundleVersion:  metadata.BundleVersion,
++		MinimumOS:      metadata.MinimumOS,
++		DeviceFamilies: metadata.DeviceFamilies,
++		Method:         "ipa",
++	}, nil
  }
 diff --git a/pkg/appstore/appstore_macos_probe.go b/pkg/appstore/appstore_macos_probe.go
 new file mode 100644
@@ -485,3 +501,60 @@ index 0000000..896745b
 +
 +	return io.ReadAll(reader)
 +}
+diff --git a/pkg/appstore/appstore_partial_zip.go b/pkg/appstore/appstore_partial_zip.go
+index d824c43..3e6bec1 100644
+--- a/pkg/appstore/appstore_partial_zip.go
++++ b/pkg/appstore/appstore_partial_zip.go
+@@ -29,6 +29,10 @@ var infoPlistDisplayVersionKeys = []string{
+ type versionMetadata struct {
+ 	DisplayVersion string
+ 	ReleaseDate    time.Time
++	// Filled from an IPA's Info.plist; empty when the key is absent.
++	BundleVersion  string
++	MinimumOS      string
++	DeviceFamilies string
+ }
+ 
+ type httpRangeReaderAt struct {
+@@ -233,9 +237,41 @@ func readVersionMetadataFromInfoPlist(file *zip.File) (versionMetadata, error) {
+ 	return versionMetadata{
+ 		DisplayVersion: displayVersion,
+ 		ReleaseDate:    releaseDate,
++		BundleVersion:  infoPlistString(metadata, "CFBundleVersion"),
++		MinimumOS:      infoPlistString(metadata, "MinimumOSVersion"),
++		DeviceFamilies: infoPlistDeviceFamilies(metadata),
+ 	}, nil
+ }
+ 
++func infoPlistString(metadata map[string]interface{}, key string) string {
++	value, _ := metadata[key].(string)
++
++	return strings.TrimSpace(value)
++}
++
++// infoPlistDeviceFamilies names the UIDeviceFamily values an app declares.
++func infoPlistDeviceFamilies(metadata map[string]interface{}) string {
++	values, _ := metadata["UIDeviceFamily"].([]interface{})
++	names := make([]string, 0, len(values))
++
++	for _, value := range values {
++		switch fmt.Sprint(value) {
++		case "1":
++			names = append(names, "iphone")
++		case "2":
++			names = append(names, "ipad")
++		case "3":
++			names = append(names, "appletv")
++		case "4":
++			names = append(names, "watch")
++		case "7":
++			names = append(names, "vision")
++		}
++	}
++
++	return strings.Join(names, ",")
++}
++
+ func readDisplayVersionFromMetadata(metadata map[string]interface{}) (string, error) {
+ 	for _, key := range infoPlistDisplayVersionKeys {
+ 		value, ok := metadata[key]
