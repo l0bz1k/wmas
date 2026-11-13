@@ -1,0 +1,89 @@
+diff --git a/cmd/common.go b/cmd/common.go
+index b419e7a..53e4fb9 100644
+--- a/cmd/common.go
++++ b/cmd/common.go
+@@ -59,14 +59,14 @@ func newCookieJar(stateDirectory string) http.CookieJar {
+ }
+ 
+ // newKeychain returns a new keychain instance.
+-func newKeychain(stateDirectory string, interactive bool) keychain.Keychain {
++func newKeychain(stateDirectory, serviceName string, interactive bool) keychain.Keychain {
+ 	ring := util.Must(openKeyring(keyring.Config{
+ 		AllowedBackends: []keyring.BackendType{
+ 			keyring.KeychainBackend,
+ 			keyring.SecretServiceBackend,
+ 			keyring.FileBackend,
+ 		},
+-		ServiceName:              KeychainServiceName,
++		ServiceName:              serviceName,
+ 		KeychainTrustApplication: true,
+ 		FileDir:                  stateDirectory,
+ 		FilePasswordFunc: func(s string) (string, error) {
+@@ -90,7 +90,7 @@ func newKeychain(stateDirectory string, interactive bool) keychain.Keychain {
+ 
+ 	return keychain.New(keychain.Args{
+ 		Keyring: ring,
+-		Label:   KeychainServiceName,
++		Label:   serviceName,
+ 	})
+ }
+ 
+@@ -108,8 +108,14 @@ func initWithCommand(cmd *cobra.Command) {
+ 	dependencies.OS = operatingsystem.New()
+ 	dependencies.Machine = machine.New(machine.Args{OS: dependencies.OS})
+ 	stateDirectory := util.Must(prepareStateDirectory(dependencies.OS, dependencies.Machine.HomeDirectory()))
++
++	stateDirectory, serviceName, err := resolveProfile(dependencies.OS, stateDirectory)
++	if err != nil {
++		panic(err.Error())
++	}
++
+ 	dependencies.CookieJar = newCookieJar(stateDirectory)
+-	dependencies.Keychain = newKeychain(stateDirectory, interactive)
++	dependencies.Keychain = newKeychain(stateDirectory, serviceName, interactive)
+ 	dependencies.AppStore = appstore.NewAppStore(appstore.Args{
+ 		CookieJar:       dependencies.CookieJar,
+ 		OperatingSystem: dependencies.OS,
+diff --git a/cmd/profile.go b/cmd/profile.go
+new file mode 100644
+index 0000000..9ca7bfa
+--- /dev/null
++++ b/cmd/profile.go
+@@ -0,0 +1,37 @@
++package cmd
++
++import (
++	"fmt"
++	"path/filepath"
++	"regexp"
++
++	"github.com/majd/ipatool/v2/pkg/util/operatingsystem"
++)
++
++// ProfileEnvironmentVariable selects an isolated account profile. Unset keeps
++// the stock single-account storage, so an existing session is the default
++// profile.
++const ProfileEnvironmentVariable = "IPATOOL_PROFILE"
++
++var profileNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
++
++// resolveProfile namespaces the two places a session lives: the state
++// directory (cookie jar, file keyring) and the keychain service that holds the
++// account, anisette and kbsync entries.
++func resolveProfile(os operatingsystem.OperatingSystem, stateDirectory string) (string, string, error) {
++	profile := os.Getenv(ProfileEnvironmentVariable)
++	if profile == "" {
++		return stateDirectory, KeychainServiceName, nil
++	}
++
++	if !profileNamePattern.MatchString(profile) {
++		return "", "", fmt.Errorf("invalid %s %q: use letters, digits, dot, underscore or hyphen", ProfileEnvironmentVariable, profile)
++	}
++
++	directory := filepath.Join(stateDirectory, "profiles", profile)
++	if err := os.MkdirAll(directory, 0700); err != nil {
++		return "", "", fmt.Errorf("failed to create profile directory: %w", err)
++	}
++
++	return directory, KeychainServiceName + "." + profile, nil
++}

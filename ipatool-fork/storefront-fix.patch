@@ -1,0 +1,56 @@
+diff --git a/pkg/appstore/storefront.go b/pkg/appstore/storefront.go
+index 8509321..a6c5e3e 100644
+--- a/pkg/appstore/storefront.go
++++ b/pkg/appstore/storefront.go
+@@ -16,6 +16,9 @@ const (
+ 	availableStorefrontsURL = "https://itunes.apple.com/WebObjects/MZStore.woa/wa/availableStoreFronts"
+ 	storefrontGenreURL      = "https://apps.apple.com/genre/id36"
+ 	maxStorefrontIDRange    = 1000
++	// Configurator UAs get HTTP 404 from availableStoreFronts; the legacy
++	// iTunes UA returns the full storefront plist.
++	availableStorefrontsUserAgent = "iTunes/12.6.5 (Macintosh; OS X 10.13)"
+ )
+ 
+ type availableStorefrontsResult struct {
+@@ -243,18 +246,27 @@ func (t *appstore) discoverAvailableStorefronts() error {
+ 		URL:            availableStorefrontsURL,
+ 		Method:         http.MethodGET,
+ 		ResponseFormat: http.ResponseFormatRaw,
++		Headers: map[string]string{
++			"User-Agent": availableStorefrontsUserAgent,
++		},
+ 	})
+ 	if err != nil {
+-		return fmt.Errorf("available storefronts request failed: %w", err)
++		t.storefrontCountryCodes = staticStorefrontCountryCodes()
++
++		return nil
+ 	}
+ 
+ 	if res.StatusCode != gohttp.StatusOK {
+-		return NewErrorWithMetadata(errors.New("available storefronts request failed"), res)
++		t.storefrontCountryCodes = staticStorefrontCountryCodes()
++
++		return nil
+ 	}
+ 
+ 	var result availableStorefrontsResult
+ 	if _, err = plist.Unmarshal(res.Data, &result); err != nil {
+-		return fmt.Errorf("failed to decode available storefronts: %w", err)
++		t.storefrontCountryCodes = staticStorefrontCountryCodes()
++
++		return nil
+ 	}
+ 
+ 	countryCodes := make(map[string]string, len(result.Storefronts))
+@@ -269,7 +281,9 @@ func (t *appstore) discoverAvailableStorefronts() error {
+ 	}
+ 
+ 	if len(countryCodes) == 0 {
+-		return errors.New("available storefronts response contains no storefronts")
++		t.storefrontCountryCodes = staticStorefrontCountryCodes()
++
++		return nil
+ 	}
+ 
+ 	t.storefrontCountryCodes = countryCodes

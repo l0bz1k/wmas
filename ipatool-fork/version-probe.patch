@@ -1,0 +1,487 @@
+diff --git a/cmd/get_version_metadata.go b/cmd/get_version_metadata.go
+index 5f307ca..bd976a1 100644
+--- a/cmd/get_version_metadata.go
++++ b/cmd/get_version_metadata.go
+@@ -16,6 +16,7 @@ func getVersionMetadataCmd() *cobra.Command {
+ 		bundleID          string
+ 		externalVersionID string
+ 		platformValue     string
++		probeOnly         bool
+ 	)
+ 
+ 	cmd := &cobra.Command{
+@@ -70,17 +71,35 @@ func getVersionMetadataCmd() *cobra.Command {
+ 					App:       app,
+ 					VersionID: externalVersionID,
+ 					Platform:  platform,
++					ProbeOnly: probeOnly,
+ 				})
+ 				if err != nil {
+ 					return err
+ 				}
+ 
+-				dependencies.Logger.Log().
++				event := dependencies.Logger.Log().
+ 					Str("externalVersionID", externalVersionID).
+ 					Str("displayVersion", out.DisplayVersion).
+-					Time("releaseDate", out.ReleaseDate).
+-					Bool("success", true).
+-					Send()
++					Time("releaseDate", out.ReleaseDate)
++
++				if out.Method != "" {
++					event = event.Str("method", out.Method)
++				}
++
++				if out.Method == "probe" {
++					event = event.
++						Str("bundleVersion", out.BundleVersion).
++						Str("minimumOS", out.MinimumOS).
++						Str("architectures", out.Architectures).
++						Int64("packageSize", out.PackageSize).
++						Int64("bytesFetched", out.BytesFetched)
++				}
++
++				if out.ProbeError != "" {
++					event = event.Str("probeError", out.ProbeError)
++				}
++
++				event.Bool("success", true).Send()
+ 
+ 				return nil
+ 			},
+@@ -103,6 +122,8 @@ func getVersionMetadataCmd() *cobra.Command {
+ 
+ 	cmd.Flags().StringVar(&platformValue, "platform", "", "Platform to retrieve metadata for: iphone (iOS), ipad (iPadOS), appletv (tvOS), watchos, visionos, or macos")
+ 
++	cmd.Flags().BoolVar(&probeOnly, "probe-only", false, "For Mac packages, fail instead of downloading the whole package when the ranged probe fails")
++
+ 	_ = cmd.MarkFlagRequired("external-version-id")
+ 
+ 	return cmd
+diff --git a/pkg/appstore/appstore_get_version_metadata.go b/pkg/appstore/appstore_get_version_metadata.go
+index e81877e..4a8da48 100644
+--- a/pkg/appstore/appstore_get_version_metadata.go
++++ b/pkg/appstore/appstore_get_version_metadata.go
+@@ -14,11 +14,23 @@ type GetVersionMetadataInput struct {
+ 	App       App
+ 	VersionID string
+ 	Platform  Platform
++	// ProbeOnly forbids falling back to a full package download when the
++	// ranged probe of a Mac package fails.
++	ProbeOnly bool
+ }
+ 
+ type GetVersionMetadataOutput struct {
+ 	DisplayVersion string
+ 	ReleaseDate    time.Time
++	// The fields below are only filled for Mac packages read by ranged probe.
++	BundleVersion string
++	MinimumOS     string
++	Architectures string
++	PackageSize   int64
++	BytesFetched  int64
++	// Method is "probe" (ranged read), "full" (whole package) or "ipa".
++	Method     string
++	ProbeError string
+ }
+ 
+ func (t *appstore) GetVersionMetadata(input GetVersionMetadataInput) (GetVersionMetadataOutput, error) {
+@@ -88,12 +100,35 @@ func (t *appstore) GetVersionMetadata(input GetVersionMetadataInput) (GetVersion
+ 				return GetVersionMetadataOutput{}, err
+ 			}
+ 
++			probe, probeErr := t.probeMacPackage(input.Context, item, hardwareID, input.App.BundleID)
++			if probeErr == nil {
++				return GetVersionMetadataOutput{
++					DisplayVersion: probe.DisplayVersion,
++					ReleaseDate:    probe.ReleaseDate,
++					BundleVersion:  probe.BundleVersion,
++					MinimumOS:      probe.MinimumOS,
++					Architectures:  probe.Architectures,
++					PackageSize:    probe.PackageSize,
++					BytesFetched:   probe.BytesFetched,
++					Method:         "probe",
++				}, nil
++			}
++
++			if input.ProbeOnly {
++				return GetVersionMetadataOutput{}, fmt.Errorf("failed to probe macOS package: %w", probeErr)
++			}
++
+ 			metadata, err := t.readVersionMetadataFromMacPackage(input.Context, item, hardwareID, input.App.BundleID)
+ 			if err != nil {
+ 				return GetVersionMetadataOutput{}, fmt.Errorf("failed to read macOS version metadata: %w", err)
+ 			}
+ 
+-			return GetVersionMetadataOutput(metadata), nil
++			return GetVersionMetadataOutput{
++				DisplayVersion: metadata.DisplayVersion,
++				ReleaseDate:    metadata.ReleaseDate,
++				Method:         "full",
++				ProbeError:     probeErr.Error(),
++			}, nil
+ 		}
+ 	}
+ 
+@@ -105,5 +140,5 @@ func (t *appstore) GetVersionMetadata(input GetVersionMetadataInput) (GetVersion
+ 		return GetVersionMetadataOutput{}, fmt.Errorf("failed to read version metadata: %w", err)
+ 	}
+ 
+-	return GetVersionMetadataOutput(metadata), nil
++	return GetVersionMetadataOutput{DisplayVersion: metadata.DisplayVersion, ReleaseDate: metadata.ReleaseDate, Method: "ipa"}, nil
+ }
+diff --git a/pkg/appstore/appstore_macos_probe.go b/pkg/appstore/appstore_macos_probe.go
+new file mode 100644
+index 0000000..896745b
+--- /dev/null
++++ b/pkg/appstore/appstore_macos_probe.go
+@@ -0,0 +1,348 @@
++package appstore
++
++import (
++	"bytes"
++	"compress/zlib"
++	"context"
++	"encoding/binary"
++	"encoding/xml"
++	"errors"
++	"fmt"
++	"io"
++	gohttp "net/http"
++	"path"
++	"regexp"
++	"strconv"
++	"strings"
++	"time"
++)
++
++// macProbeChunkSize mirrors the StoreAgent decryption unit. Ranges handed to the
++// decrypter must start on a chunk boundary.
++const (
++	macProbeChunkSize = 0x8000
++	macProbeMaxSpan   = 8 << 20
++)
++
++var (
++	macProbeMinOSPattern = regexp.MustCompile(`<os-version[^>]*\bmin="([^"]+)"`)
++	macProbeArchPattern  = regexp.MustCompile(`hostArchitectures="([^"]+)"`)
++)
++
++type macPackageProbe struct {
++	DisplayVersion string
++	BundleVersion  string
++	ReleaseDate    time.Time
++	MinimumOS      string
++	Architectures  string
++	PackageSize    int64
++	BytesFetched   int64
++}
++
++type xarTOCFile struct {
++	Name  string `xml:"name"`
++	Mtime string `xml:"mtime"`
++	Data  *struct {
++		Offset   int64 `xml:"offset"`
++		Length   int64 `xml:"length"`
++		Encoding struct {
++			Style string `xml:"style,attr"`
++		} `xml:"encoding"`
++	} `xml:"data"`
++	Files []xarTOCFile `xml:"file"`
++}
++
++type xarTOCDocument struct {
++	Files []xarTOCFile `xml:"toc>file"`
++}
++
++type macProbeEntry struct {
++	name   string
++	start  int64
++	length int64
++	gzip   bool
++}
++
++// probeMacPackage reads a Mac package's version, minimum OS and architectures
++// from two small ranges instead of the whole download: the XAR table of
++// contents at the front, then the chunk-aligned tail holding PackageInfo and
++// Distribution, which XAR stores after the payload.
++func (t *appstore) probeMacPackage(ctx context.Context, item downloadItemResult, hardwareID []byte, bundleID string) (_ macPackageProbe, err error) {
++	if ctx == nil {
++		ctx = context.Background()
++	}
++
++	dpInfo, err := macDPInfo(item.Sinfs)
++	if err != nil {
++		return macPackageProbe{}, err
++	}
++
++	factory := t.macDecrypterFactory
++	if factory == nil {
++		factory = defaultMacPackageDecrypterFactory
++	}
++
++	decrypter, err := factory(ctx, append([]byte(nil), hardwareID...), append([]byte(nil), dpInfo...))
++	if err != nil {
++		return macPackageProbe{}, fmt.Errorf("failed to initialize macOS package decrypter: %w", err)
++	}
++
++	defer func() {
++		if closeErr := decrypter.Close(); closeErr != nil && err == nil {
++			err = fmt.Errorf("failed to close macOS package decrypter: %w", closeErr)
++		}
++	}()
++
++	var result macPackageProbe
++
++	fetch := func(start, end int64) ([]byte, error) {
++		encrypted, total, fetchErr := t.fetchMacPackageRange(ctx, item.URL, start, end)
++		if fetchErr != nil {
++			return nil, fetchErr
++		}
++
++		result.PackageSize = total
++		result.BytesFetched += int64(len(encrypted))
++
++		var plain bytes.Buffer
++		if _, decryptErr := decrypter.Decrypt(ctx, &plain, bytes.NewReader(encrypted)); decryptErr != nil {
++			return nil, fmt.Errorf("failed to decrypt package range %d-%d: %w", start, end, decryptErr)
++		}
++
++		return plain.Bytes(), nil
++	}
++
++	head, err := fetch(0, macProbeChunkSize-1)
++	if err != nil {
++		return macPackageProbe{}, err
++	}
++
++	if len(head) < 28 || string(head[:4]) != "xar!" {
++		return macPackageProbe{}, errors.New("decrypted package does not start with a XAR header")
++	}
++
++	headerSize := int64(binary.BigEndian.Uint16(head[4:6]))
++	tocLength := int64(binary.BigEndian.Uint64(head[8:16]))
++	heap := headerSize + tocLength
++
++	if tocLength <= 0 || heap > macProbeMaxSpan {
++		return macPackageProbe{}, fmt.Errorf("unexpected XAR table of contents length %d", tocLength)
++	}
++
++	if int64(len(head)) < heap {
++		end := alignMacProbe(heap) - 1
++		if end >= result.PackageSize {
++			end = result.PackageSize - 1
++		}
++
++		more, moreErr := fetch(int64(len(head)), end)
++		if moreErr != nil {
++			return macPackageProbe{}, moreErr
++		}
++
++		head = append(head, more...)
++	}
++
++	if int64(len(head)) < heap {
++		return macPackageProbe{}, errors.New("package is shorter than its XAR table of contents")
++	}
++
++	tocXML, err := inflateMacProbe(head[headerSize:heap])
++	if err != nil {
++		return macPackageProbe{}, fmt.Errorf("failed to inflate XAR table of contents: %w", err)
++	}
++
++	var document xarTOCDocument
++	if err := xml.Unmarshal(tocXML, &document); err != nil {
++		return macPackageProbe{}, fmt.Errorf("failed to parse XAR table of contents: %w", err)
++	}
++
++	var (
++		entries      []macProbeEntry
++		payloadTimes = map[string]string{}
++	)
++
++	var walk func(files []xarTOCFile, prefix string)
++
++	walk = func(files []xarTOCFile, prefix string) {
++		for _, file := range files {
++			name := path.Join(prefix, file.Name)
++
++			switch {
++			case file.Data != nil && (path.Base(name) == "PackageInfo" || name == "Distribution"):
++				entries = append(entries, macProbeEntry{
++					name:   name,
++					start:  heap + file.Data.Offset,
++					length: file.Data.Length,
++					gzip:   strings.Contains(file.Data.Encoding.Style, "gzip"),
++				})
++			case path.Base(name) == "Payload":
++				payloadTimes[path.Dir(name)] = file.Mtime
++			}
++
++			walk(file.Files, name)
++		}
++	}
++	walk(document.Files, "")
++
++	if len(entries) == 0 {
++		return macPackageProbe{}, errors.New("XAR table of contents lists no PackageInfo or Distribution")
++	}
++
++	low, high := entries[0].start, entries[0].start+entries[0].length
++	for _, entry := range entries[1:] {
++		if entry.start < low {
++			low = entry.start
++		}
++
++		if entry.start+entry.length > high {
++			high = entry.start + entry.length
++		}
++	}
++
++	if high > result.PackageSize {
++		return macPackageProbe{}, errors.New("XAR entries extend past the end of the package")
++	}
++
++	alignedLow := low / macProbeChunkSize * macProbeChunkSize
++	alignedHigh := alignMacProbe(high)
++
++	if alignedHigh > result.PackageSize {
++		alignedHigh = result.PackageSize
++	}
++
++	if alignedHigh-alignedLow > macProbeMaxSpan {
++		return macPackageProbe{}, fmt.Errorf("package metadata spans %d bytes, too much for a ranged probe", alignedHigh-alignedLow)
++	}
++
++	var tail []byte
++
++	tailBase := alignedLow
++	if alignedHigh <= int64(len(head)) {
++		tail, tailBase = head, 0
++	} else {
++		tail, err = fetch(alignedLow, alignedHigh-1)
++		if err != nil {
++			return macPackageProbe{}, err
++		}
++	}
++
++	matched := false
++
++	for _, entry := range entries {
++		from := entry.start - tailBase
++		if from < 0 || from+entry.length > int64(len(tail)) {
++			return macPackageProbe{}, fmt.Errorf("XAR entry %q lies outside the fetched range", entry.name)
++		}
++
++		data := tail[from : from+entry.length]
++		if entry.gzip {
++			data, err = inflateMacProbe(data)
++			if err != nil {
++				return macPackageProbe{}, fmt.Errorf("failed to inflate %q (chunks may not decrypt independently): %w", entry.name, err)
++			}
++		}
++
++		if entry.name == "Distribution" {
++			if match := macProbeMinOSPattern.FindSubmatch(data); match != nil {
++				result.MinimumOS = string(match[1])
++			}
++
++			if match := macProbeArchPattern.FindSubmatch(data); match != nil {
++				result.Architectures = string(match[1])
++			}
++
++			continue
++		}
++
++		var info struct {
++			Bundles []struct {
++				ID            string `xml:"id,attr"`
++				Version       string `xml:"CFBundleShortVersionString,attr"`
++				BundleVersion string `xml:"CFBundleVersion,attr"`
++			} `xml:"bundle"`
++		}
++
++		if err := xml.Unmarshal(data, &info); err != nil {
++			return macPackageProbe{}, fmt.Errorf("failed to parse %q: %w", entry.name, err)
++		}
++
++		for _, bundle := range info.Bundles {
++			if bundleID != "" && bundle.ID != bundleID {
++				continue
++			}
++
++			if matched || strings.TrimSpace(bundle.Version) == "" {
++				continue
++			}
++
++			matched = true
++			result.DisplayVersion = strings.TrimSpace(bundle.Version)
++			result.BundleVersion = strings.TrimSpace(bundle.BundleVersion)
++
++			if stamp, parseErr := time.Parse(time.RFC3339, payloadTimes[path.Dir(entry.name)]); parseErr == nil {
++				result.ReleaseDate = stamp.UTC()
++			}
++		}
++	}
++
++	if !matched {
++		return macPackageProbe{}, errors.New("macOS package does not contain metadata for the requested bundle")
++	}
++
++	return result, nil
++}
++
++func (t *appstore) fetchMacPackageRange(ctx context.Context, url string, start, end int64) ([]byte, int64, error) {
++	req, err := t.httpClient.NewRequest("GET", url, nil)
++	if err != nil {
++		return nil, 0, fmt.Errorf("failed to create request: %w", err)
++	}
++
++	req = req.WithContext(ctx)
++	req.Header.Set("Accept-Encoding", "identity")
++	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
++
++	res, err := t.httpClient.Do(req)
++	if err != nil {
++		return nil, 0, fmt.Errorf("range request failed: %w", err)
++	}
++	defer res.Body.Close()
++
++	// A 200 would mean the server ignored Range and is sending the whole
++	// package, which is exactly what a probe must not download.
++	if res.StatusCode != gohttp.StatusPartialContent {
++		return nil, 0, fmt.Errorf("range request returned HTTP %d", res.StatusCode)
++	}
++
++	_, totalText, found := strings.Cut(res.Header.Get("Content-Range"), "/")
++	if !found {
++		return nil, 0, errors.New("range response has no Content-Range total")
++	}
++
++	total, err := strconv.ParseInt(strings.TrimSpace(totalText), 10, 64)
++	if err != nil {
++		return nil, 0, fmt.Errorf("invalid Content-Range total %q: %w", totalText, err)
++	}
++
++	data, err := io.ReadAll(io.LimitReader(res.Body, end-start+1))
++	if err != nil {
++		return nil, 0, fmt.Errorf("failed to read range: %w", err)
++	}
++
++	return data, total, nil
++}
++
++func alignMacProbe(offset int64) int64 {
++	return (offset + macProbeChunkSize - 1) / macProbeChunkSize * macProbeChunkSize
++}
++
++func inflateMacProbe(data []byte) ([]byte, error) {
++	reader, err := zlib.NewReader(bytes.NewReader(data))
++	if err != nil {
++		return nil, err
++	}
++	defer reader.Close()
++
++	return io.ReadAll(reader)
++}

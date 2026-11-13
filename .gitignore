@@ -1,0 +1,16 @@
+# Downloaded packages and their SHA256SUMS logs.
+artifacts/
+
+# Built ipatool binary; build it with scripts/build-ipatool.sh.
+bin/
+
+# Transient
+*.log
+.DS_Store
+
+# Upstream ipatool working clone (has its own .git). Pinned in ipatool-fork/UPSTREAM.
+ipatool-fork/src/
+
+# WMAS runtime state: cache and account registry
+state/
+__pycache__/

@@ -1,0 +1,28 @@
+repo:    https://github.com/majd/ipatool
+commit:  3e84853e2e5d60540a5022b64895d496910144eb
+date:    2026-11-12
+subject: perf: streamline apple asset downloads and caching
+
+Build with scripts/build-ipatool.sh. It clones upstream into ipatool-fork/src
+(gitignored), checks out the commit above, copies storefront_static.go into
+pkg/appstore/, applies the three patches and builds bin/ipatool.
+
+If proxy.golang.org is unreachable from your network, run it with
+GOPROXY=direct GOSUMDB=off.
+
+The directory is named src, not upstream: on a case-insensitive filesystem a path
+like ipatool-fork/upstream collides with this UPSTREAM file.
+
+Patches:
+  storefront-fix.patch   static storefront table fallback + iTunes UA (needs
+                         storefront_static.go copied in first)
+  version-probe.patch    get-version-metadata reads Mac packages by ranged probe:
+                         XAR table of contents from the first chunk, then the
+                         chunk-aligned tail with PackageInfo and Distribution.
+                         Adds minimumOS, architectures, bundleVersion, packageSize,
+                         bytesFetched to the output and a --probe-only flag.
+                         Upstream downloads the entire package for this.
+  profiles.patch         IPATOOL_PROFILE=<name> isolates an Apple ID: its own keychain
+                         service (ipatool-auth.service.<name>) and state directory
+                         (~/.ipatool/profiles/<name>). Unset keeps stock storage, so
+                         the existing session is the default profile.
